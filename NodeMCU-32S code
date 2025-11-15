@@ -1,0 +1,107 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ===== 設定 Wi-Fi =====
+const char* ssid = "33H3F2-2.4G";
+const char* password = "20040315";
+
+// ===== 馬達 PWM 設定 =====
+const int motorPin = 18;       // 連接到 ULN2803 的 IN1
+const int ledcChannel = 0;     // PWM channel
+const int freq = 1000;         // PWM 頻率 1kHz
+const int resolution = 8;      // 8-bit resolution (0-255)
+int motorSpeed = 0;             // 初始speed 0
+
+// ===== 建立 Web Server =====
+WebServer server(80);
+
+// ===== 網頁 HTML =====
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Motor Control</title>
+  <style>
+    body { font-family: Arial; text-align: center; margin-top: 50px; }
+    button { font-size: 30px; width: 100px; height: 100px; margin: 20px; }
+    #speedDisplay { font-size: 40px; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h1>NodeMCU Motor Control</h1>
+  <button onclick="changeSpeed('up')"> up</button>
+  <button onclick="changeSpeed('down')"> down</button>
+  <div id="speedDisplay">current speed: 0</div>
+
+  <script>
+    function changeSpeed(dir) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/change?dir=" + dir, true);
+      xhr.onload = function() {
+        document.getElementById('speedDisplay').innerText = "speed: " + xhr.responseText;
+      };
+      xhr.send();
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ===== 處理加減速請求 =====
+void handleChange() {
+  if (server.hasArg("dir")) {
+    String dir = server.arg("dir");
+    if (dir == "up") {
+      motorSpeed += 15;  // 每次加 15
+      if (motorSpeed > 255) motorSpeed = 255;
+    } else if (dir == "down") {
+      motorSpeed -= 15;  // 每次減 15
+      if (motorSpeed < 0) motorSpeed = 0;
+    }
+    ledcWrite(ledcChannel, motorSpeed);
+    server.send(200, "text/plain", String(motorSpeed));
+  } else {
+    server.send(400, "text/plain", "Missing direction");
+  }
+}
+
+// ===== 處理首頁 =====
+void handleRoot() {
+  server.send_P(200, "text/html", index_html);
+}
+
+// ===== 初始化 PWM =====
+void setupPWM() {
+  ledcSetup(ledcChannel, freq, resolution);
+  ledcAttachPin(motorPin, ledcChannel);
+  ledcWrite(ledcChannel, motorSpeed); // 預設馬達停止
+}
+
+// ===== Arduino setup =====
+void setup() {
+  Serial.begin(115200);
+  setupPWM();
+
+  // 連接 Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // 設定 Web Server 路由
+  server.on("/", handleRoot);
+  server.on("/change", handleChange);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ===== Arduino loop =====
+void loop() {
+  server.handleClient(); // 處理網頁請求
+}
+
