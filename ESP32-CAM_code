@@ -1,0 +1,248 @@
+// ===== ESP32-CAM Timelapse to microSD  =====
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "FS.h"
+#include "SD_MMC.h"
+#include <time.h>
+
+#define USE_WIFI_TIME   1                 // 1=連Wi-Fi校時；0=不連網(用遞增檔名)
+const char* WIFI_SSID = "33H3F2-2.4G";   // 只有在 USE_WIFI_TIME=1 時會用到
+const char* WIFI_PASS = "20040315";
+const char* TZ_STRING = "CST-8";          // 台北時區 (UTC+8)
+const uint32_t INTERVAL_MS = 10 * 1000;   // 拍照間隔(毫秒) → 10 秒
+const char* SAVE_DIR = "/DCIM";           // 影像儲存資料夾
+
+// ---------- AI Thinker ESP32-CAM 腳位 ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// 可選：板載補光 LED (GPIO4) — 若要用 SD 4-bit 會衝突，這裡改用 SD 1-bit，LED 仍可用。
+#define LED_FLASH_GPIO     4
+#define LED_ON_LEVEL       1  
+
+// ---------- 全域 ----------
+uint64_t shot_counter = 0;
+uint32_t last_ms = 0;
+
+// 取得目前是否有有效時間（避免 NTP 還沒同步時用錯誤時間）
+bool timeIsSet() {
+  time_t now; time(&now);
+  struct tm info;
+  localtime_r(&now, &info);
+  return (info.tm_year + 1900) >= 2020;
+}
+
+String makeFilename() {
+  if (USE_WIFI_TIME && timeIsSet()) {
+    time_t now; time(&now);
+    struct tm tinfo; localtime_r(&now, &tinfo);
+    char buf[32];
+    // YYYYMMDD_HHMMSS.jpg
+    strftime(buf, sizeof(buf), "/%Y%m%d_%H%M%S.jpg", &tinfo);
+    return String(SAVE_DIR) + String(buf);
+  } else {
+    // Fallback: 000001.jpg, 000002.jpg, ...
+    char buf[20];
+    snprintf(buf, sizeof(buf), "/%06llu.jpg", (unsigned long long)++shot_counter);
+    return String(SAVE_DIR) + String(buf);
+  }
+}
+
+bool saveImageToSD(camera_fb_t* fb, const String& path) { // 確保資料夾存在
+  if (!SD_MMC.exists(SAVE_DIR)) {
+    if (!SD_MMC.mkdir(SAVE_DIR)) {
+      Serial.println("[SD] mkdir failed");
+      return false;
+    }
+  }
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if (!f) {
+    Serial.println("[SD] open failed");
+    return false;
+  }
+  size_t written = f.write(fb->buf, fb->len);
+  f.close();
+  return (written == fb->len);
+}
+
+void wifiSyncTime() {
+#if USE_WIFI_TIME
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  for (int i = 0; i < 100 && WiFi.status() != WL_CONNECTED; ++i) {
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+    setenv("TZ", TZ_STRING, 1);
+    tzset();
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    Serial.print("[NTP] Syncing");
+    for (int i = 0; i < 100 && !timeIsSet(); ++i) {
+      delay(100);
+      Serial.print(".");
+    }
+    Serial.println();
+    if (timeIsSet()) {
+      time_t now; time(&now);
+      Serial.print("[NTP] Synced: "); Serial.println(ctime(&now));
+    } else {
+      Serial.println("[NTP] Failed to get time, fallback to counter filenames.");
+    }
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+  } else {
+    Serial.println("[WiFi] Connect failed, skip NTP.");
+  }
+#endif
+}
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_VGA; // 視需求改VGA/QVGA/UXGA
+    config.jpeg_quality = 12;
+    config.fb_count     = 2;
+  } else {
+    config.frame_size   = FRAMESIZE_QVGA;
+    config.jpeg_quality = 15;
+    config.fb_count     = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] Init failed 0x%x\n", err);
+    return false;
+  }
+  sensor_t* s = esp_camera_sensor_get();
+s->set_whitebal(s, 1);     // 開白平衡
+s->set_awb_gain(s, 1);     // 允許自動調增益
+s->set_lenc(s, 1);         // 鏡頭飽和校正
+s->set_exposure_ctrl(s, 1);
+s->set_aec2(s, 1);
+for (int i=0; i<4; ++i) {
+  camera_fb_t* tmp = esp_camera_fb_get();
+  if (tmp) esp_camera_fb_return(tmp);
+  delay(30);
+}
+camera_fb_t* fb = esp_camera_fb_get();
+  return true;
+}
+
+bool initSD() { // 1-bit 模式，避開 GPIO4 衝突
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("[SD] SD_MMC begin failed");
+    return false;
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[SD] No card");
+    return false;
+  }
+  Serial.printf("[SD] Card OK, type=%u, size=%.2f MB\n", cardType, SD_MMC.cardSize() / (1024.0 * 1024.0));
+  return true;
+}
+
+void flashOn(bool on) {
+  pinMode(LED_FLASH_GPIO, OUTPUT);
+  digitalWrite(LED_FLASH_GPIO, on ? LED_ON_LEVEL : !LED_ON_LEVEL);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n[BOOT] Timelapse to SD");
+  pinMode(LED_FLASH_GPIO, OUTPUT);
+  flashOn(false); // 補光燈關閉
+
+  if (!initCamera()) {
+    Serial.println("[BOOT] Camera init failed, halt.");
+    while (1) delay(1000);
+  }
+  if (!initSD()) {
+    Serial.println("[BOOT] SD init failed, halt.");
+    while (1) delay(1000);
+  }
+  wifiSyncTime();
+  last_ms = millis() - INTERVAL_MS; // 一開機就先拍一張
+}
+
+void loop() {
+  uint32_t now = millis();
+  if (now - last_ms >= INTERVAL_MS) {
+    last_ms = now;
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("[CAM] Capture failed");
+      return;
+    }
+    if (fb->format != PIXFORMAT_JPEG) {
+      uint8_t* jpg = nullptr; size_t len = 0;
+      if (!frame2jpg(fb, 80, &jpg, &len)) {
+        esp_camera_fb_return(fb);
+        Serial.println("[CAM] JPEG convert failed");
+        return;
+      }
+      String path = makeFilename();
+      File f = SD_MMC.open(path, FILE_WRITE);
+      if (!f) {
+        Serial.printf("[SD] Open failed: %s\n", path.c_str());
+        free(jpg);
+        esp_camera_fb_return(fb);
+        return;
+      }
+      size_t w = f.write(jpg, len);
+      f.close();
+      free(jpg);
+      esp_camera_fb_return(fb);
+      Serial.printf("[SAVE] %s (%u bytes)%s\n",
+                    path.c_str(), (unsigned)w, (w ? "" : " [WRITE FAIL]"));
+    } else {
+      String path = makeFilename();
+      bool ok = saveImageToSD(fb, path);
+      esp_camera_fb_return(fb);
+      Serial.printf("[SAVE] %s (%s) len=%u\n", path.c_str(), ok ? "OK" : "FAIL", (unsigned)fb->len);
+    }
+  }
+  delay(5);
+}
